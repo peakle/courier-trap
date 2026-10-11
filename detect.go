@@ -38,11 +38,35 @@ type ChainDetector struct {
 func (d *ChainDetector) Close() error { return nil }
 
 func (d *ChainDetector) Detect(_, gray gocv.Mat) []Candidate {
-	return d.detectIn(gray, image.Point{})
+	return d.detectIn(gray, image.Point{}, d.maxDigitH(gray))
+}
+
+// zoneDetector — детектор, умеющий искать номер только в заданных местах кадра
+// (маска фиолетового короба).
+type zoneDetector interface {
+	DetectZones(gray, mask gocv.Mat) []Candidate
+}
+
+// DetectZones ищет только внутри зон короба — координаты кандидатов в системе
+// кадра. Предел высоты цифры считается от всего кадра: внутри зоны цифра
+// занимает заметную долю высоты, и доля от зоны отбросила бы её как слишком крупную.
+func (d *ChainDetector) DetectZones(gray, mask gocv.Mat) []Candidate {
+	maxH := d.maxDigitH(gray)
+	var out []Candidate
+	for _, z := range purpleZones(mask, d.MinDigitH) {
+		sub := gray.Region(z)
+		out = append(out, d.detectIn(sub, z.Min, maxH)...)
+		sub.Close()
+	}
+	return out
+}
+
+func (d *ChainDetector) maxDigitH(gray gocv.Mat) int {
+	return int(float64(gray.Rows()) * d.MaxDigitFrac)
 }
 
 // detectIn работает на gray (может быть ROI), off — смещение ROI в кадре.
-func (d *ChainDetector) detectIn(gray gocv.Mat, off image.Point) []Candidate {
+func (d *ChainDetector) detectIn(gray gocv.Mat, off image.Point, maxH int) []Candidate {
 	bin := gocv.NewMat()
 	defer bin.Close()
 	gocv.AdaptiveThreshold(gray, &bin, 255, gocv.AdaptiveThresholdMean, gocv.ThresholdBinaryInv, 31, 15)
@@ -50,7 +74,6 @@ func (d *ChainDetector) detectIn(gray gocv.Mat, off image.Point) []Candidate {
 	contours := gocv.FindContours(bin, gocv.RetrievalList, gocv.ChainApproxSimple)
 	defer contours.Close()
 
-	maxH := int(float64(gray.Rows()) * d.MaxDigitFrac)
 	blobs := make([]image.Rectangle, 0, 256)
 	for i := 0; i < contours.Size(); i++ {
 		r := gocv.BoundingRect(contours.At(i))
@@ -197,7 +220,7 @@ func (d *YOLODetector) Detect(bgr, gray gocv.Mat) []Candidate {
 	for _, i := range nms(rects, scores, d.nms) {
 		r := rects[i]
 		roi := gray.Region(r)
-		refined := d.refine.detectIn(roi, r.Min)
+		refined := d.refine.detectIn(roi, r.Min, roi.Rows())
 		roi.Close()
 		if len(refined) > 0 {
 			res = append(res, refined[0])

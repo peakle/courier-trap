@@ -27,13 +27,13 @@ type config struct {
 	idle, closeAfter                                           time.Duration
 	minDigitH, minReads, modelSize                             int
 	modelConf                                                  float64
-	verbose, show                                              bool
+	verbose, show, purple                                      bool
 }
 
 func main() {
 	var c config
 	flag.StringVar(&c.src, "src", "0", "видеопоток: rtsp://..., файл или индекс устройства")
-	flag.StringVar(&c.images, "image", "", "тест: распознать фото (через запятую) и выйти")
+	flag.StringVar(&c.images, "image", "", "тест: распознать фото и выйти — файлы, каталоги или шаблоны через запятую")
 	flag.StringVar(&c.cameraID, "camera-id", "cam-1", "идентификатор точки")
 	flag.StringVar(&c.backend, "backend", "", "URL для POST событий (пусто — печать в stdout)")
 	flag.StringVar(&c.token, "token", os.Getenv("BACKEND_TOKEN"), "Bearer-токен (или env BACKEND_TOKEN)")
@@ -51,6 +51,7 @@ func main() {
 	flag.IntVar(&c.minReads, "min-reads", 5, "чтений до подтверждения визита")
 	flag.Float64Var(&c.minAgree, "min-agree", 0.7, "минимальное согласие голосов 0..1")
 	flag.Float64Var(&c.minConf, "min-conf", 50, "минимальная уверенность OCR 0..100")
+	flag.BoolVar(&c.purple, "purple", true, "искать номер только в зоне фиолетового короба (выключить для ч/б камеры)")
 	flag.BoolVar(&c.verbose, "v", false, "логировать каждое чтение")
 	flag.BoolVar(&c.show, "show", true, "окно с разметкой в реальном времени (q/Esc — выход)")
 	flag.StringVar(&c.annotate, "annotate", "", "фото-режим: сохранить размеченный кадр в файл")
@@ -65,6 +66,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+	reader.Verbose = c.verbose
 	defer reader.Close()
 
 	switch {
@@ -87,7 +89,7 @@ func newDetector(c config) (Detector, error) {
 
 // recognize — один кадр: детекция + OCR. Координаты — относительно frame.
 // rejected — кандидаты, которые OCR не принял (нужны только для разметки).
-func recognize(frame gocv.Mat, det Detector, reader *Reader, scale float64) (reads []Read, rejected []Candidate) {
+func recognize(frame gocv.Mat, det Detector, reader *Reader, scale float64, purple bool) (reads []Read, rejected []Candidate) {
 	work := frame
 	if scale != 1 {
 		up := gocv.NewMat()
@@ -98,7 +100,7 @@ func recognize(frame gocv.Mat, det Detector, reader *Reader, scale float64) (rea
 	gray := gocv.NewMat()
 	defer gray.Close()
 	gocv.CvtColor(work, &gray, gocv.ColorBGRToGray)
-	for _, cand := range det.Detect(work, gray) {
+	for _, cand := range detect(det, work, gray, purple) {
 		if r, ok := reader.Read(work, gray, cand); ok {
 			r.Rect = shrink(r.Rect, scale)
 			reads = append(reads, r)
@@ -108,6 +110,18 @@ func recognize(frame gocv.Mat, det Detector, reader *Reader, scale float64) (rea
 		}
 	}
 	return reads, rejected
+}
+
+// detect — детекция по всему кадру или только в зонах фиолетового короба,
+// если детектор это умеет и цветовой фильтр включён.
+func detect(det Detector, work, gray gocv.Mat, purple bool) []Candidate {
+	zd, ok := det.(zoneDetector)
+	if !ok || !purple {
+		return det.Detect(work, gray)
+	}
+	mask := purpleMask(work)
+	defer mask.Close()
+	return zd.DetectZones(gray, mask)
 }
 
 // shrink возвращает прямоугольник из увеличенного кадра в координаты исходного.
@@ -123,7 +137,7 @@ func shrink(r image.Rectangle, scale float64) image.Rectangle {
 
 func runImages(c config, det Detector, reader *Reader) int {
 	found := 0
-	paths := strings.Split(c.images, ",")
+	paths := imagePaths(c.images)
 	for i, path := range paths {
 		img := gocv.IMRead(strings.TrimSpace(path), gocv.IMReadColor)
 		if img.Empty() {
@@ -132,7 +146,7 @@ func runImages(c config, det Detector, reader *Reader) int {
 		}
 		frame, roi, closeROI := applyROI(img, c.roi)
 		start := time.Now()
-		reads, rejected := recognize(frame, det, reader, c.scale)
+		reads, rejected := recognize(frame, det, reader, c.scale, c.purple)
 		elapsed := time.Since(start)
 		closeROI()
 		if c.annotate != "" {
@@ -160,6 +174,42 @@ func runImages(c config, det Detector, reader *Reader) int {
 		return 1
 	}
 	return 0
+}
+
+// imagePaths раскрывает -image: файлы, каталоги целиком и шаблоны (dataset/*.jpg)
+// через запятую.
+func imagePaths(spec string) []string {
+	var out []string
+	for _, p := range strings.Split(spec, ",") {
+		p = strings.TrimSpace(p)
+		if st, err := os.Stat(p); err == nil && st.IsDir() {
+			ents, err := os.ReadDir(p)
+			if err != nil {
+				log.Printf("%s: %v", p, err)
+				continue
+			}
+			for _, e := range ents {
+				if !e.IsDir() && isImageFile(e.Name()) {
+					out = append(out, filepath.Join(p, e.Name()))
+				}
+			}
+			continue
+		}
+		if m, _ := filepath.Glob(p); len(m) > 0 {
+			out = append(out, m...)
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+func isImageFile(name string) bool {
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".jpg", ".jpeg", ".png", ".bmp":
+		return true
+	}
+	return false
 }
 
 // annotatePath: для нескольких фото добавляем индекс, чтобы не перезаписать файл.
@@ -254,7 +304,7 @@ func processSource(ctx context.Context, c config, isFile bool, det Detector, rea
 		moved := motionRatio(work, &prev) > c.motion
 		if moved || now.Sub(lastFull) >= c.idle {
 			lastFull = now
-			reads, rejected = recognize(work, det, reader, c.scale)
+			reads, rejected = recognize(work, det, reader, c.scale, c.purple)
 			if c.verbose {
 				log.Printf("t=%s motion=%v reads=%d", now.Sub(start).Round(10*time.Millisecond), moved, len(reads))
 			}

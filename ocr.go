@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"image"
 	"image/color"
+	"log"
 	"math"
 	"regexp"
 	"strings"
@@ -25,7 +26,8 @@ type Reader struct {
 	client  *gosseract.Client
 	re      *regexp.Regexp
 	minConf float64
-	targetH int // к какой высоте цифры масштабируем кроп
+	targetH int  // к какой высоте цифры масштабируем кроп
+	Verbose bool // логировать отклонённые кандидаты (-v)
 }
 
 func NewReader(pattern string, minConf float64) (*Reader, error) {
@@ -47,6 +49,12 @@ func NewReader(pattern string, minConf float64) (*Reader, error) {
 }
 
 func (r *Reader) Close() error { return r.client.Close() }
+
+func (r *Reader) logf(format string, a ...any) {
+	if r.Verbose {
+		log.Printf(format, a...)
+	}
+}
 
 func (r *Reader) Read(bgr, gray gocv.Mat, c Candidate) (Read, bool) {
 	frame := image.Rect(0, 0, gray.Cols(), gray.Rows())
@@ -112,6 +120,7 @@ func (r *Reader) Read(bgr, gray gocv.Mat, c Candidate) (Read, bool) {
 	}
 	id := strings.Join(strings.Fields(text), "")
 	if !r.re.MatchString(id) {
+		r.logf("  ocr %v: текст %q не подошёл под -pattern", c.Rect, id)
 		return Read{}, false
 	}
 	// Уверенность строки Tesseract на таких кропах часто равна нулю,
@@ -126,6 +135,7 @@ func (r *Reader) Read(bgr, gray gocv.Mat, c Candidate) (Read, bool) {
 	}
 	conf /= float64(len(boxes))
 	if conf < r.minConf {
+		r.logf("  ocr %v: %s уверенность %.0f < %.0f", c.Rect, id, conf, r.minConf)
 		return Read{}, false
 	}
 
