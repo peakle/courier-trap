@@ -166,3 +166,19 @@ func randID() string {
 	_, _ = rand.Read(b)
 	return hex.EncodeToString(b)
 }
+
+// VisitState — состояние открытого визита для окна предпросмотра.
+type VisitState struct {
+	ID        string
+	Reads     int
+	Agreement float64
+	Confirmed bool
+}
+
+func (t *Tracker) Snapshot() []VisitState {
+	out := make([]VisitState, 0, len(t.open))
+	for _, v := range t.open {
+		out = append(out, VisitState{ID: v.ID, Reads: v.Reads, Agreement: v.agreement(), Confirmed: v.Confirmed})
+	}
+	return out
+}

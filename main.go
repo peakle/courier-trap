@@ -11,6 +11,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -21,16 +22,17 @@ import (
 
 type config struct {
 	src, images, cameraID, backend, token, model, roi, pattern string
-	fps, motion, minConf, minAgree                             float64
+	annotate                                                   string
+	fps, motion, minConf, minAgree, scale                      float64
 	idle, closeAfter                                           time.Duration
 	minDigitH, minReads, modelSize                             int
 	modelConf                                                  float64
-	verbose                                                    bool
+	verbose, show                                              bool
 }
 
 func main() {
 	var c config
-	flag.StringVar(&c.src, "src", "", "видеопоток: rtsp://..., файл или индекс устройства")
+	flag.StringVar(&c.src, "src", "0", "видеопоток: rtsp://..., файл или индекс устройства")
 	flag.StringVar(&c.images, "image", "", "тест: распознать фото (через запятую) и выйти")
 	flag.StringVar(&c.cameraID, "camera-id", "cam-1", "идентификатор точки")
 	flag.StringVar(&c.backend, "backend", "", "URL для POST событий (пусто — печать в stdout)")
@@ -40,6 +42,7 @@ func main() {
 	flag.Float64Var(&c.modelConf, "model-conf", 0.4, "порог уверенности детектора")
 	flag.StringVar(&c.roi, "roi", "", "зона обработки x,y,w,h (пусто — весь кадр)")
 	flag.StringVar(&c.pattern, "pattern", `^\d{5}$`, "регулярка допустимого номера")
+	flag.Float64Var(&c.scale, "scale", 1, "увеличить кадр перед распознаванием (мелкие номера, низкое разрешение)")
 	flag.Float64Var(&c.fps, "fps", 2, "сколько кадров в секунду анализировать")
 	flag.Float64Var(&c.motion, "motion", 0.002, "доля изменившихся пикселей для запуска распознавания")
 	flag.DurationVar(&c.idle, "idle", 5*time.Second, "распознавать и без движения раз в N (стоящие курьеры)")
@@ -49,6 +52,8 @@ func main() {
 	flag.Float64Var(&c.minAgree, "min-agree", 0.7, "минимальное согласие голосов 0..1")
 	flag.Float64Var(&c.minConf, "min-conf", 50, "минимальная уверенность OCR 0..100")
 	flag.BoolVar(&c.verbose, "v", false, "логировать каждое чтение")
+	flag.BoolVar(&c.show, "show", true, "окно с разметкой в реальном времени (q/Esc — выход)")
+	flag.StringVar(&c.annotate, "annotate", "", "фото-режим: сохранить размеченный кадр в файл")
 	flag.Parse()
 
 	det, err := newDetector(c)
@@ -81,34 +86,62 @@ func newDetector(c config) (Detector, error) {
 }
 
 // recognize — один кадр: детекция + OCR. Координаты — относительно frame.
-func recognize(frame gocv.Mat, det Detector, reader *Reader) []Read {
+// rejected — кандидаты, которые OCR не принял (нужны только для разметки).
+func recognize(frame gocv.Mat, det Detector, reader *Reader, scale float64) (reads []Read, rejected []Candidate) {
+	work := frame
+	if scale != 1 {
+		up := gocv.NewMat()
+		defer up.Close()
+		gocv.Resize(frame, &up, image.Point{}, scale, scale, gocv.InterpolationCubic)
+		work = up
+	}
 	gray := gocv.NewMat()
 	defer gray.Close()
-	gocv.CvtColor(frame, &gray, gocv.ColorBGRToGray)
-	var reads []Read
-	for _, cand := range det.Detect(frame, gray) {
-		if r, ok := reader.Read(frame, gray, cand); ok {
+	gocv.CvtColor(work, &gray, gocv.ColorBGRToGray)
+	for _, cand := range det.Detect(work, gray) {
+		if r, ok := reader.Read(work, gray, cand); ok {
+			r.Rect = shrink(r.Rect, scale)
 			reads = append(reads, r)
+		} else {
+			cand.Rect = shrink(cand.Rect, scale)
+			rejected = append(rejected, cand)
 		}
 	}
-	return reads
+	return reads, rejected
+}
+
+// shrink возвращает прямоугольник из увеличенного кадра в координаты исходного.
+func shrink(r image.Rectangle, scale float64) image.Rectangle {
+	if scale == 1 {
+		return r
+	}
+	return image.Rect(int(float64(r.Min.X)/scale), int(float64(r.Min.Y)/scale),
+		int(float64(r.Max.X)/scale), int(float64(r.Max.Y)/scale))
 }
 
 // ---------------------------------------------------------------- фото-режим
 
 func runImages(c config, det Detector, reader *Reader) int {
 	found := 0
-	for _, path := range strings.Split(c.images, ",") {
+	paths := strings.Split(c.images, ",")
+	for i, path := range paths {
 		img := gocv.IMRead(strings.TrimSpace(path), gocv.IMReadColor)
 		if img.Empty() {
 			log.Printf("%s: не удалось прочитать", path)
 			continue
 		}
-		frame, closeROI := applyROI(img, c.roi)
+		frame, roi, closeROI := applyROI(img, c.roi)
 		start := time.Now()
-		reads := recognize(frame, det, reader)
+		reads, rejected := recognize(frame, det, reader, c.scale)
 		elapsed := time.Since(start)
 		closeROI()
+		if c.annotate != "" {
+			annotate(img, roi, reads, rejected, nil)
+			out := annotatePath(c.annotate, i, len(paths))
+			if !gocv.IMWrite(out, img) {
+				log.Printf("%s: не удалось сохранить разметку в %s", path, out)
+			}
+		}
 		img.Close()
 		for _, r := range reads {
 			found++
@@ -129,6 +162,15 @@ func runImages(c config, det Detector, reader *Reader) int {
 	return 0
 }
 
+// annotatePath: для нескольких фото добавляем индекс, чтобы не перезаписать файл.
+func annotatePath(base string, i, n int) string {
+	if n < 2 {
+		return base
+	}
+	ext := filepath.Ext(base)
+	return fmt.Sprintf("%s-%d%s", strings.TrimSuffix(base, ext), i+1, ext)
+}
+
 // ---------------------------------------------------------------- поток
 
 func runStream(c config, det Detector, reader *Reader) {
@@ -140,12 +182,17 @@ func runStream(c config, det Detector, reader *Reader) {
 		CameraID: c.cameraID, MinReads: c.minReads, MinAgree: c.minAgree,
 		CloseAfter: c.closeAfter, Emit: sender.Send,
 	}
+	var pv *Preview
+	if c.show {
+		pv = NewPreview("courier-trap")
+		defer pv.Close()
+	}
 	isFile := isFileSource(c.src)
 	retry := time.Second
 
 	for ctx.Err() == nil {
-		if ended := processSource(ctx, c, isFile, det, reader, tracker); ended {
-			break // файл закончился
+		if ended := processSource(ctx, c, isFile, det, reader, tracker, pv); ended {
+			break // файл закончился или окно закрыли
 		}
 		if ctx.Err() == nil {
 			log.Printf("поток недоступен, переподключение через %s", retry)
@@ -162,8 +209,9 @@ func runStream(c config, det Detector, reader *Reader) {
 	sender.Close(10 * time.Second)
 }
 
-// processSource читает поток до ошибки. ended=true — штатный конец файла.
-func processSource(ctx context.Context, c config, isFile bool, det Detector, reader *Reader, tr *Tracker) (ended bool) {
+// processSource читает поток до ошибки. ended=true — штатный конец файла
+// или выход из окна предпросмотра.
+func processSource(ctx context.Context, c config, isFile bool, det Detector, reader *Reader, tr *Tracker, pv *Preview) (ended bool) {
 	vc, err := openCapture(c.src)
 	if err != nil {
 		log.Printf("open %s: %v", c.src, err)
@@ -180,6 +228,9 @@ func processSource(ctx context.Context, c config, isFile bool, det Detector, rea
 	interval := time.Duration(float64(time.Second) / c.fps)
 	start := time.Now()
 	var nextTick, lastFull time.Time
+	// Последняя разметка держится в окне до следующего распознавания.
+	var reads []Read
+	var rejected []Candidate
 
 	for ctx.Err() == nil {
 		// Метка времени: для файла — время внутри видео, для потока — часы.
@@ -199,11 +250,11 @@ func processSource(ctx context.Context, c config, isFile bool, det Detector, rea
 		}
 		nextTick = now.Add(interval)
 
-		work, closeROI := applyROI(frame, c.roi)
+		work, roi, closeROI := applyROI(frame, c.roi)
 		moved := motionRatio(work, &prev) > c.motion
 		if moved || now.Sub(lastFull) >= c.idle {
 			lastFull = now
-			reads := recognize(work, det, reader)
+			reads, rejected = recognize(work, det, reader, c.scale)
 			if c.verbose {
 				log.Printf("t=%s motion=%v reads=%d", now.Sub(start).Round(10*time.Millisecond), moved, len(reads))
 			}
@@ -216,6 +267,13 @@ func processSource(ctx context.Context, c config, isFile bool, det Detector, rea
 		}
 		closeROI()
 		tr.Tick(now)
+
+		if pv != nil {
+			annotate(frame, roi, reads, rejected, tr.Snapshot())
+			if !pv.Show(frame) {
+				return true
+			}
+		}
 	}
 	return false
 }
@@ -240,9 +298,11 @@ func motionRatio(frame gocv.Mat, prev *gocv.Mat) float64 {
 	return float64(gocv.CountNonZero(diff)) / float64(w*h)
 }
 
-func applyROI(frame gocv.Mat, roi string) (gocv.Mat, func()) {
+// applyROI возвращает рабочую область кадра и её прямоугольник в координатах кадра.
+func applyROI(frame gocv.Mat, roi string) (gocv.Mat, image.Rectangle, func()) {
+	full := image.Rect(0, 0, frame.Cols(), frame.Rows())
 	if roi == "" {
-		return frame, func() {}
+		return frame, full, func() {}
 	}
 	p := strings.Split(roi, ",")
 	if len(p) != 4 {
@@ -256,12 +316,12 @@ func applyROI(frame gocv.Mat, roi string) (gocv.Mat, func()) {
 		}
 		v[i] = n
 	}
-	r := image.Rect(v[0], v[1], v[0]+v[2], v[1]+v[3]).Intersect(image.Rect(0, 0, frame.Cols(), frame.Rows()))
+	r := image.Rect(v[0], v[1], v[0]+v[2], v[1]+v[3]).Intersect(full)
 	if r.Empty() {
 		log.Fatalf("-roi вне кадра")
 	}
 	sub := frame.Region(r)
-	return sub, func() { sub.Close() }
+	return sub, r, func() { sub.Close() }
 }
 
 func openCapture(src string) (*gocv.VideoCapture, error) {

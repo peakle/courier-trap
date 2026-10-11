@@ -54,8 +54,10 @@ func (r *Reader) Read(bgr, gray gocv.Mat, c Candidate) (Read, bool) {
 	if h == 0 {
 		h = c.Rect.Dy()
 	}
-	pad := int(0.35*float64(h)) + 2
-	rect := c.Rect.Inset(-pad).Intersect(frame)
+	// По горизонтали поле шире: цепочка блобов часто теряет крайнюю цифру.
+	padY := int(0.35*float64(h)) + 2
+	padX := int(0.8*float64(h)) + 2
+	rect := image.Rect(c.Rect.Min.X-padX, c.Rect.Min.Y-padY, c.Rect.Max.X+padX, c.Rect.Max.Y+padY).Intersect(frame)
 	if rect.Empty() {
 		return Read{}, false
 	}
@@ -82,16 +84,19 @@ func (r *Reader) Read(bgr, gray gocv.Mat, c Candidate) (Read, bool) {
 	defer scaled.Close()
 	gocv.Resize(work, &scaled, image.Point{}, s, s, gocv.InterpolationCubic)
 
-	// 3. Бинаризация Оцу; цифры должны быть тёмными на светлом.
-	bw := gocv.NewMat()
-	defer bw.Close()
-	gocv.Threshold(scaled, &bw, 0, 255, gocv.ThresholdBinary|gocv.ThresholdOtsu)
-	if gocv.CountNonZero(bw) < bw.Rows()*bw.Cols()/2 {
-		gocv.BitwiseNot(bw, &bw) // светлые цифры на тёмном фоне
+	// 3. Локальное выравнивание контраста. Без бинаризации: на ночных кадрах
+	// Оцу съедает тонкие штрихи, а LSTM Tesseract нормально читает серое.
+	eq := gocv.NewMat()
+	defer eq.Close()
+	clahe := gocv.NewCLAHEWithParams(2, image.Pt(8, 8))
+	clahe.Apply(scaled, &eq)
+	clahe.Close()
+	if eq.Mean().Val1 < 110 {
+		gocv.BitwiseNot(eq, &eq) // светлые цифры на тёмном фоне
 	}
 	padded := gocv.NewMat()
 	defer padded.Close()
-	gocv.CopyMakeBorder(bw, &padded, 20, 20, 20, 20, gocv.BorderConstant, color.RGBA{255, 255, 255, 0})
+	gocv.CopyMakeBorder(eq, &padded, 20, 20, 20, 20, gocv.BorderConstant, color.RGBA{255, 255, 255, 0})
 
 	png, err := gocv.IMEncode(gocv.PNGFileExt, padded)
 	if err != nil {
@@ -109,10 +114,17 @@ func (r *Reader) Read(bgr, gray gocv.Mat, c Candidate) (Read, bool) {
 	if !r.re.MatchString(id) {
 		return Read{}, false
 	}
+	// Уверенность строки Tesseract на таких кропах часто равна нулю,
+	// поэтому усредняем по символам.
 	conf := 0.0
-	if boxes, err := r.client.GetBoundingBoxes(gosseract.RIL_TEXTLINE); err == nil && len(boxes) > 0 {
-		conf = boxes[0].Confidence
+	boxes, err := r.client.GetBoundingBoxes(gosseract.RIL_SYMBOL)
+	if err != nil || len(boxes) == 0 {
+		return Read{}, false
 	}
+	for _, b := range boxes {
+		conf += b.Confidence
+	}
+	conf /= float64(len(boxes))
 	if conf < r.minConf {
 		return Read{}, false
 	}
