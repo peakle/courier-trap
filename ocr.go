@@ -50,6 +50,50 @@ func NewReader(pattern string, minConf float64) (*Reader, error) {
 
 func (r *Reader) Close() error { return r.client.Close() }
 
+// pad — светлое поле вокруг кропа: Tesseract не любит текст впритык к краю.
+func pad(m gocv.Mat) gocv.Mat {
+	out := gocv.NewMat()
+	gocv.CopyMakeBorder(m, &out, 20, 20, 20, 20, gocv.BorderConstant, color.RGBA{255, 255, 255, 0})
+	return out
+}
+
+// ocr — одна попытка чтения подготовленного кропа: текст, прошедший -pattern,
+// и уверенность (среднее по символам: у строки она на таких кропах нулевая).
+func (r *Reader) ocr(img gocv.Mat, at image.Rectangle) (string, float64, bool) {
+	defer img.Close()
+	png, err := gocv.IMEncode(gocv.PNGFileExt, img)
+	if err != nil {
+		return "", 0, false
+	}
+	defer png.Close()
+	if err := r.client.SetImageFromBytes(png.GetBytes()); err != nil {
+		return "", 0, false
+	}
+	text, err := r.client.Text()
+	if err != nil {
+		return "", 0, false
+	}
+	id := strings.Join(strings.Fields(text), "")
+	if !r.re.MatchString(id) {
+		r.logf("  ocr %v: текст %q не подошёл под -pattern", at, id)
+		return "", 0, false
+	}
+	boxes, err := r.client.GetBoundingBoxes(gosseract.RIL_SYMBOL)
+	if err != nil || len(boxes) == 0 {
+		return "", 0, false
+	}
+	conf := 0.0
+	for _, b := range boxes {
+		conf += b.Confidence
+	}
+	conf /= float64(len(boxes))
+	if conf < r.minConf {
+		r.logf("  ocr %v: %s уверенность %.0f < %.0f", at, id, conf, r.minConf)
+		return "", 0, false
+	}
+	return id, conf, true
+}
+
 func (r *Reader) logf(format string, a ...any) {
 	if r.Verbose {
 		log.Printf(format, a...)
@@ -102,40 +146,18 @@ func (r *Reader) Read(bgr, gray gocv.Mat, c Candidate) (Read, bool) {
 	if eq.Mean().Val1 < 110 {
 		gocv.BitwiseNot(eq, &eq) // светлые цифры на тёмном фоне
 	}
-	padded := gocv.NewMat()
-	defer padded.Close()
-	gocv.CopyMakeBorder(eq, &padded, 20, 20, 20, 20, gocv.BorderConstant, color.RGBA{255, 255, 255, 0})
-
-	png, err := gocv.IMEncode(gocv.PNGFileExt, padded)
-	if err != nil {
-		return Read{}, false
+	// Полярность кропа заранее не известна: инверсия по средней яркости верна
+	// на ночных кадрах и ошибается на крупном плане, где поля кропа заняты
+	// тёмным коробом. Поэтому при неудаче пробуем обратную полярность.
+	// Бордюр всегда светлый, поэтому инвертировать нужно до его добавления.
+	id, conf, ok := r.ocr(pad(eq), c.Rect)
+	if !ok {
+		inv := gocv.NewMat()
+		gocv.BitwiseNot(eq, &inv)
+		id, conf, ok = r.ocr(pad(inv), c.Rect)
+		inv.Close()
 	}
-	defer png.Close()
-	if err := r.client.SetImageFromBytes(png.GetBytes()); err != nil {
-		return Read{}, false
-	}
-	text, err := r.client.Text()
-	if err != nil {
-		return Read{}, false
-	}
-	id := strings.Join(strings.Fields(text), "")
-	if !r.re.MatchString(id) {
-		r.logf("  ocr %v: текст %q не подошёл под -pattern", c.Rect, id)
-		return Read{}, false
-	}
-	// Уверенность строки Tesseract на таких кропах часто равна нулю,
-	// поэтому усредняем по символам.
-	conf := 0.0
-	boxes, err := r.client.GetBoundingBoxes(gosseract.RIL_SYMBOL)
-	if err != nil || len(boxes) == 0 {
-		return Read{}, false
-	}
-	for _, b := range boxes {
-		conf += b.Confidence
-	}
-	conf /= float64(len(boxes))
-	if conf < r.minConf {
-		r.logf("  ocr %v: %s уверенность %.0f < %.0f", c.Rect, id, conf, r.minConf)
+	if !ok {
 		return Read{}, false
 	}
 

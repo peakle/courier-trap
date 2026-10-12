@@ -48,14 +48,21 @@ type zoneDetector interface {
 }
 
 // DetectZones ищет только внутри зон короба — координаты кандидатов в системе
-// кадра. Предел высоты цифры считается от всего кадра: внутри зоны цифра
-// занимает заметную долю высоты, и доля от зоны отбросила бы её как слишком крупную.
+// кадра. Предел высоты цифры — максимум из доли кадра и половины зоны: доля
+// от зоны отбросила бы цифру как слишком крупную, а доля от кадра не пропускает
+// крупный план, где цифра занимает больше MaxDigitFrac высоты кадра.
 func (d *ChainDetector) DetectZones(gray, mask gocv.Mat) []Candidate {
 	maxH := d.maxDigitH(gray)
 	var out []Candidate
 	for _, z := range purpleZones(mask, d.MinDigitH) {
+		// В зоне короба цифра бывает крупнее доли кадра (крупный план),
+		// но не выше половины короба.
+		zoneMax := maxH
+		if h := z.Dy() / 2; h > zoneMax {
+			zoneMax = h
+		}
 		sub := gray.Region(z)
-		out = append(out, d.detectIn(sub, z.Min, maxH)...)
+		out = append(out, d.detectIn(sub, z.Min, zoneMax)...)
 		sub.Close()
 	}
 	return out
